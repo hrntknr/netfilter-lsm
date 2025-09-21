@@ -18,7 +18,9 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
-#define ALLOWED_CG_SIZE 256
+// protect netfilter socket section
+
+#define ALLOWED_CG_SIZE 16
 
 struct
 {
@@ -26,32 +28,122 @@ struct
   __uint(max_entries, ALLOWED_CG_SIZE);
   __type(key, __u32);
   __type(value, __u32);
-} allowed_cg SEC(".maps");
+} protect_nftables_allowed_cg SEC(".maps");
 
-struct
+static __always_inline int allowed_cg_idx(void)
 {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __type(key, __u32);
-  __type(value, __u8);
-  __uint(max_entries, 4096);
-} protected_links SEC(".maps");
+  for (__u32 i = 0; i < ALLOWED_CG_SIZE; i++)
+  {
+    if (bpf_current_task_under_cgroup(&protect_nftables_allowed_cg, i) == 1)
+    {
+      return i;
+    }
+  }
+  return -1;
+}
 
 SEC("lsm/socket_create")
-int BPF_PROG(deny_nf_sock_create, int family, int type, int protocol, int kern)
+int BPF_PROG(protect_nftables, int family, int type, int protocol, int kern)
 {
   if (family != AF_NETLINK)
     return 0;
   if (protocol != NETLINK_NETFILTER)
     return 0;
-  for (__u32 i = 0; i < ALLOWED_CG_SIZE; i++)
+  if (allowed_cg_idx() >= 0)
+    return 0;
+  return -EPERM;
+}
+
+// protect cgroup exec section
+
+#define ALLOWED_PATHS_SIZE 16
+#define MAXP 256
+
+struct
+{
+  __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+  __type(key, int);
+  __type(value, __u8);
+} protect_cgroup_exec_allowed_task SEC(".maps");
+
+struct
+{
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, __u64);
+  __type(value, char[MAXP]);
+  __uint(max_entries, ALLOWED_CG_SIZE *ALLOWED_PATHS_SIZE);
+} protect_cgroup_exec_allowed_paths SEC(".maps");
+
+SEC("lsm/task_alloc")
+int BPF_PROG(protect_cgroup_exec_alloc, struct task_struct *task, unsigned long clone_flags)
+{
+  if (allowed_cg_idx() < 0)
+    return 0;
+
+  __u8 *pflag = bpf_task_storage_get(&protect_cgroup_exec_allowed_task, bpf_get_current_task_btf(), 0, 0);
+  __u8 val = pflag ? *pflag : 0;
+  if (val)
   {
-    if (bpf_current_task_under_cgroup(&allowed_cg, i) == 1)
+    __u8 *cflag = bpf_task_storage_get(&protect_cgroup_exec_allowed_task, task, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+    if (cflag)
+      *cflag = 1;
+  }
+  return 0;
+}
+static __always_inline int str_eq(const char *a, const char *b)
+{
+  for (int i = 0; i < MAXP; i++)
+  {
+    if (a[i] != b[i])
+      return 0;
+    if (a[i] == '\0')
+      return 1;
+  }
+  return 1;
+}
+
+SEC("lsm/bprm_check_security")
+int BPF_PROG(protect_cgroup_exec_check, struct linux_binprm *bprm, int ret)
+{
+  __u32 cg = allowed_cg_idx();
+  if (cg == -1)
+    return 0;
+
+  __u8 *flag = bpf_task_storage_get(&protect_cgroup_exec_allowed_task, bpf_get_current_task_btf(), 0, 0);
+  if (flag && *flag)
+    return 0;
+
+  struct file *f = BPF_CORE_READ(bprm, file);
+  if (!f)
+    return -EPERM;
+
+  struct dentry *d = BPF_CORE_READ(f, f_path.dentry);
+  const unsigned char *kname = BPF_CORE_READ(d, d_name.name);
+
+  char path_buf[MAXP];
+  long n = bpf_probe_read_kernel_str(path_buf, MAXP, kname);
+  if (n <= 0)
+    return -EPERM;
+
+  for (__u32 i = 0; i < ALLOWED_PATHS_SIZE; i++)
+  {
+    __u64 key = cg * ALLOWED_PATHS_SIZE + i;
+    char *allowed = bpf_map_lookup_elem(&protect_cgroup_exec_allowed_paths, &key);
+    if (!allowed)
+      break;
+    if (str_eq(allowed, path_buf))
     {
+      __u8 *m = bpf_task_storage_get(&protect_cgroup_exec_allowed_task, bpf_get_current_task_btf(), 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+      if (m)
+        *m = 1;
       return 0;
     }
   }
   return -EPERM;
 }
+
+// protect bpf section
 
 static __always_inline bool is_bpffs(const struct super_block *sb)
 {
