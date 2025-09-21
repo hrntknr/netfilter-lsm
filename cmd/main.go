@@ -14,7 +14,7 @@ func main() {
 	}
 
 	// sudo systemd-run --scope --slice=test bash -c "nft list ruleset"
-	if err := nflsm.AllowNftables("test.slice", []string{"bash"}); err != nil {
+	if err := nflsm.AllowNftables("test.slice", []string{"/usr/bin/bash"}); err != nil {
 		panic(err)
 	}
 
@@ -22,7 +22,7 @@ func main() {
 		panic(err)
 	}
 
-	// if err := nflsm.ProtectBpf(); err != nil {
-	// 	panic(err)
-	// }
+	if err := nflsm.ProtectBpf(); err != nil {
+		panic(err)
+	}
 }

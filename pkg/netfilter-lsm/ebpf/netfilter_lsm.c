@@ -91,6 +91,7 @@ int BPF_PROG(protect_cgroup_exec_alloc, struct task_struct *task, unsigned long 
   }
   return 0;
 }
+
 static __always_inline int str_eq(const char *a, const char *b)
 {
   for (int i = 0; i < MAXP; i++)
@@ -114,16 +115,11 @@ int BPF_PROG(protect_cgroup_exec_check, struct linux_binprm *bprm, int ret)
   if (flag && *flag)
     return 0;
 
-  struct file *f = BPF_CORE_READ(bprm, file);
-  if (!f)
+  const char *path = BPF_CORE_READ(bprm, filename);
+  if (!path)
     return -EPERM;
-
-  struct dentry *d = BPF_CORE_READ(f, f_path.dentry);
-  const unsigned char *kname = BPF_CORE_READ(d, d_name.name);
-
   char path_buf[MAXP];
-  long n = bpf_probe_read_kernel_str(path_buf, MAXP, kname);
-  if (n <= 0)
+  if (bpf_probe_read_str(path_buf, sizeof(path_buf), path) < 0)
     return -EPERM;
 
   for (__u32 i = 0; i < ALLOWED_PATHS_SIZE; i++)
